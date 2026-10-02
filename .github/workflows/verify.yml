@@ -1,0 +1,89 @@
+# Fork-only verification for the Docling options fix. Never part of the PR.
+name: verify
+on:
+  push:
+    branches: ["verify/**"]
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The Docling client is plain HTTP, so its tests run in a pure-Go build
+  # (the *_nocgo.go fallbacks stand in for pdfium, the oxide libraries and the C++ binding).
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt on changed Go files
+        run: |
+          files=$(git diff --name-only HEAD~2 HEAD~1 -- '*.go')
+          echo "$files"
+          out=$(gofmt -l $files); echo "$out"; test -z "$out"
+      - name: go vet (parser package; fail only on files this change touches)
+        run: |
+          out=$(CGO_ENABLED=0 go vet ./internal/parser/parser/ 2>&1) || true
+          echo "$out"
+          changed=$(git diff --name-only HEAD~2 HEAD~1 -- '*.go' | xargs -n1 basename | paste -sd'|' -)
+          if echo "$out" | grep -E "($changed)"; then echo "::error::go vet findings in changed files"; exit 1; fi
+      - name: Docling tests WITH the fix
+        run: CGO_ENABLED=0 go test -count=1 -v -run 'Docling' ./internal/parser/parser/ 2>&1 | tee with-fix.log
+      - name: Docling tests WITHOUT the fix must fail
+        run: |
+          git checkout HEAD~2 -- internal/parser/parser/pdf_parser_docling.go
+          if grep -q doclingConvertOptions internal/parser/parser/pdf_parser_docling.go; then echo "revert did not apply"; exit 1; fi
+          if CGO_ENABLED=0 go test -count=1 -v -run 'DoclingConvertOptions' ./internal/parser/parser/ 2>&1 | tee without-fix.log; then
+            echo "::error::Docling options tests passed without the fix"; exit 1
+          fi
+          echo "---- results without the fix ----"
+          grep -E -- "--- (FAIL|PASS)|options\[" without-fix.log | head -40
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-logs
+          path: "*.log"
+
+  # Compile and link the package the way RAGFlow ships it (cgo, static native libs).
+  cgo-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/.ghcup
+          df -h /
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: astral-sh/setup-uv@v6
+      - name: System packages
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends libpcre2-dev lld clang && command -v ld.lld
+      - name: Native dependencies (download_deps.py)
+        run: |
+          # The script ends by fetching Hugging Face models, which a compile check does not need.
+          uv run python3 ragflow_deps/download_deps.py > deps.log 2>&1 || echo "download_deps.py exited non-zero (models step); checking native libs"
+          for d in office_oxide pdfium-static pdf_oxide onnxruntime/static_lib; do test -d "$HOME/ragflow-native-libs/$d" || { echo "missing $d"; exit 1; }; done
+      - name: C++ static library (RAGFlow builder image)
+        run: |
+          docker run --privileged -d --name builder \
+            -v "${PWD}:/ragflow" \
+            -v "${PWD}/internal/binding/cpp/resource:/usr/share/infinity/resource" \
+            infiniflow/infinity_builder:ubuntu22_clang20
+          docker exec builder bash -c 'git config --global safe.directory "*" && cd /ragflow && ./build.sh --cpp' 2>&1 | tail -20
+          sudo chown -R "$(id -u):$(id -g)" .
+      - name: Compile and link the parser test binary (cgo, static)
+        run: |
+          source ./build.sh
+          setup_cgo_env
+          CGO_ENABLED=1 CGO_CFLAGS="$CGO_CFLAGS" CGO_LDFLAGS="$CGO_LDFLAGS" \
+            go test -c -tags cgo,static -o "$PWD/parser.test" ./internal/parser/parser/
+          ls -la parser.test
